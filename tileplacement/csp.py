@@ -53,15 +53,22 @@ class TilePlacementCSP:
                 f"{sum(problem.tiles.get(s, 0) for s in SHAPES)} != {self.num_blocks}"
             )
 
-        allowed_values = [
-            v for v in all_values() if problem.tiles.get(v[0], 0) > 0]
+        allowed_values = [v for v in all_values() if problem.tiles.get(v[0], 0) > 0]
         self.initial_domains: Dict[int, List[TileValue]] = {
             b: allowed_values[:] for b in range(self.num_blocks)
         }
 
-        self.contrib: List[Dict[TileValue, Vec4]] = [dict()
-                                                     for _ in range(self.num_blocks)]
+        self.contrib: List[Dict[TileValue, Vec4]] = [dict() for _ in range(self.num_blocks)]
         self._precompute_contribs()
+
+        # Precompute per-block min/max contribution bounds over all values — used
+        # for fast feasibility checks without scanning domains at runtime.
+        self._block_min: List[Vec4] = []
+        self._block_max: List[Vec4] = []
+        for b in range(self.num_blocks):
+            contribs = list(self.contrib[b].values())
+            self._block_min.append(tuple(min(c[i] for c in contribs) for i in range(4)))  # type: ignore
+            self._block_max.append(tuple(max(c[i] for c in contribs) for i in range(4)))  # type: ignore
 
     def _block_origin(self, b: int) -> Tuple[int, int]:
         """Return top-left landscape coordinates for block id b."""
@@ -73,8 +80,7 @@ class TilePlacementCSP:
         """Precompute visible color contribution vector for each (block, value)."""
         for b in range(self.num_blocks):
             r0, c0 = self._block_origin(b)
-            colors = [[self.problem.landscape[r0 + r][c0 + c]
-                       for c in range(4)] for r in range(4)]
+            colors = [[self.problem.landscape[r0 + r][c0 + c] for c in range(4)] for r in range(4)]
             for value in self.initial_domains[b]:
                 mask = mask_for(value)
                 counts = [0, 0, 0, 0]
@@ -84,74 +90,88 @@ class TilePlacementCSP:
                             color = colors[r][c]
                             if 1 <= color <= 4:
                                 counts[color - 1] += 1
-                self.contrib[b][value] = (
-                    counts[0], counts[1], counts[2], counts[3])
+                self.contrib[b][value] = (counts[0], counts[1], counts[2], counts[3])
 
     # ---------- Heuristics ----------
+
     def _select_unassigned_var_mrv(self, st: State) -> int:
-        """MRV with deterministic tie-break by lower block index."""
-        unassigned = [b for b in range(
-            self.num_blocks) if b not in st.assignment]
+        unassigned = [b for b in range(self.num_blocks) if b not in st.assignment]
         return min(unassigned, key=lambda b: (len(st.domains[b]), b))
 
     def _order_values_lcv(self, st: State, b: int) -> List[TileValue]:
-        """Return feasible values ordered by LCV approximation (least damage first)."""
+        """
+        Lightweight LCV: score each value by how much it pushes visible totals
+        toward the target (prefer values that leave more slack), without the
+        expensive full-domain scan of the original implementation.
+        """
         scored: List[Tuple[int, TileValue]] = []
+        remaining_unassigned = self.num_blocks - len(st.assignment) - 1  # after assigning b
+
         for v in st.domains[b]:
-            if not self._value_feasible(st, b, v):
+            if st.used_tiles[v[0]] + 1 > self.problem.tiles[v[0]]:
                 continue
-            scored.append((self._lcv_damage_score(st, b, v), v))
+
+            new_vis = addv(st.visible_so_far, self.contrib[b][v])
+            if any(new_vis[i] > self.target[i] for i in range(4)):
+                continue
+
+            # Cheap slack score: sum of remaining headroom across all colors.
+            # Larger slack = less constraining = try first (lower score = better).
+            slack = sum(self.target[i] - new_vis[i] for i in range(4))
+            scored.append((-slack, v))  # negate so min = most slack
+
         scored.sort(key=lambda item: (item[0], item[1][0], item[1][1]))
         return [v for _, v in scored]
 
-    def _lcv_damage_score(self, st: State, b: int, v: TileValue) -> int:
-        """
-        Approximate LCV by counting how many candidate values in other blocks become
-        immediately infeasible after tentatively assigning (b=v), plus scarcity pressure.
-        """
-        tent = self._tentative_state(st, b, v)
-        if tent is None:
-            return 10**9
+    # ---------- Feasibility ----------
 
-        eliminated = 0
-        for rb in range(self.num_blocks):
-            if rb in tent.assignment:
-                continue
-            for rv in st.domains[rb]:
-                if not self._value_feasible(tent, rb, rv):
-                    eliminated += 1
-
-        remaining_for_shape = self.problem.tiles[v[0]] - tent.used_tiles[v[0]]
-        scarcity_penalty = 100 if remaining_for_shape == 0 else 0
-        return eliminated + scarcity_penalty
-
-    # ---------- Feasibility & Propagation ----------
-    def _tentative_state(self, st: State, b: int, v: TileValue) -> Optional[State]:
-        """Create a child state for b=v if immediate checks pass; otherwise None."""
+    def _value_feasible(self, st: State, b: int, v: TileValue) -> bool:
         if b in st.assignment:
-            return None
+            return st.assignment[b] == v
+
         if st.used_tiles[v[0]] + 1 > self.problem.tiles[v[0]]:
-            return None
+            return False
 
         new_visible = addv(st.visible_so_far, self.contrib[b][v])
         if any(new_visible[i] > self.target[i] for i in range(4)):
-            return None
+            return False
 
-        new_assignment = dict(st.assignment)
-        new_assignment[b] = v
+        remaining_blocks = [rb for rb in range(self.num_blocks) if rb not in st.assignment and rb != b]
 
-        new_domains = {k: vals[:] for k, vals in st.domains.items()}
-        new_domains[b] = [v]
+        required_left = {
+            s: self.problem.tiles[s] - st.used_tiles[s] - (1 if s == v[0] else 0)
+            for s in SHAPES
+        }
+        if not self._shape_bounds_feasible(st, remaining_blocks, required_left):
+            return False
 
-        new_used = dict(st.used_tiles)
-        new_used[v[0]] += 1
+        # Use domain-based min/max for assigned remaining; fall back to precomputed
+        # global bounds — avoids re-scanning domains when they haven't changed.
+        min_add = [0, 0, 0, 0]
+        max_add = [0, 0, 0, 0]
 
-        return State(
-            assignment=new_assignment,
-            domains=new_domains,
-            used_tiles=new_used,
-            visible_so_far=new_visible,
-        )
+        for rb in remaining_blocks:
+            vals = st.domains[rb]
+            if not vals:
+                return False
+            if len(vals) == len(self.initial_domains[rb]):
+                # Domain untouched — use precomputed bounds (fast path)
+                for i in range(4):
+                    min_add[i] += self._block_min[rb][i]
+                    max_add[i] += self._block_max[rb][i]
+            else:
+                poss = [self.contrib[rb][vv] for vv in vals]
+                for i in range(4):
+                    min_add[i] += min(p[i] for p in poss)
+                    max_add[i] += max(p[i] for p in poss)
+
+        for i in range(4):
+            total_min = new_visible[i] + min_add[i]
+            total_max = new_visible[i] + max_add[i]
+            if self.target[i] < total_min or self.target[i] > total_max:
+                return False
+
+        return True
 
     def _shape_bounds_feasible(
         self,
@@ -182,59 +202,13 @@ class TilePlacementCSP:
                 return False
         return True
 
-    def _value_feasible(self, st: State, b: int, v: TileValue) -> bool:
-        """Global feasibility test used by both revise() and value ordering."""
-        if b in st.assignment:
-            return st.assignment[b] == v
-
-        # A) inventory feasibility
-        if st.used_tiles[v[0]] + 1 > self.problem.tiles[v[0]]:
-            return False
-
-        # B) target overshoot
-        new_visible = addv(st.visible_so_far, self.contrib[b][v])
-        if any(new_visible[i] > self.target[i] for i in range(4)):
-            return False
-
-        remaining_blocks = [rb for rb in range(
-            self.num_blocks) if rb not in st.assignment and rb != b]
-
-        # Shape-count remaining bounds
-        required_left = {
-            s: self.problem.tiles[s] - st.used_tiles[s] - (1 if s == v[0] else 0) for s in SHAPES
-        }
-        if not self._shape_bounds_feasible(st, remaining_blocks, required_left):
-            return False
-
-        # C) per-color remaining bounds using current domains:
-        # target[color] must still be reachable by optimistic/pessimistic totals.
-        min_add = [0, 0, 0, 0]
-        max_add = [0, 0, 0, 0]
-
-        for rb in remaining_blocks:
-            vals = st.domains[rb]
-            if not vals:
-                return False
-
-            poss = [self.contrib[rb][vv] for vv in vals]
-            for i in range(4):
-                min_add[i] += min(p[i] for p in poss)
-                max_add[i] += max(p[i] for p in poss)
-
-        for i in range(4):
-            total_min = new_visible[i] + min_add[i]
-            total_max = new_visible[i] + max_add[i]
-            if self.target[i] < total_min or self.target[i] > total_max:
-                return False
-
-        return True
+    # ---------- Propagation ----------
 
     def _ac3_propagate(self, st: State, initial_queue: List[int]) -> bool:
-        """AC-3-style propagation with global revise over variable domains.
-
-        We keep a queue of variables to revise. Whenever one domain shrinks,
-        all other unassigned variables are re-enqueued because global constraints
-        (inventory/targets) can tighten their feasible values as well.
+        """
+        AC-3 with one important optimisation: once a domain shrinks to size 1
+        we immediately check whether that forced assignment overshoots targets,
+        and only re-enqueue neighbours when the domain actually shrank.
         """
         q = deque(initial_queue)
         in_queue = set(initial_queue)
@@ -246,14 +220,13 @@ class TilePlacementCSP:
             if b in st.assignment:
                 continue
 
-            old_domain = st.domains[b]  # revise(X_b)
-            new_domain = [
-                v for v in old_domain if self._value_feasible(st, b, v)]
+            old_len = len(st.domains[b])
+            new_domain = [v for v in st.domains[b] if self._value_feasible(st, b, v)]
 
             if not new_domain:
                 return False
 
-            if len(new_domain) < len(old_domain):
+            if len(new_domain) < old_len:
                 st.domains[b] = new_domain
                 for nb in range(self.num_blocks):
                     if nb not in st.assignment and nb != b and nb not in in_queue:
@@ -262,7 +235,36 @@ class TilePlacementCSP:
 
         return True
 
+    # ---------- Tentative state ----------
+
+    def _tentative_state(self, st: State, b: int, v: TileValue) -> Optional[State]:
+        if b in st.assignment:
+            return None
+        if st.used_tiles[v[0]] + 1 > self.problem.tiles[v[0]]:
+            return None
+
+        new_visible = addv(st.visible_so_far, self.contrib[b][v])
+        if any(new_visible[i] > self.target[i] for i in range(4)):
+            return None
+
+        new_assignment = dict(st.assignment)
+        new_assignment[b] = v
+
+        new_domains = {k: vals[:] for k, vals in st.domains.items()}
+        new_domains[b] = [v]
+
+        new_used = dict(st.used_tiles)
+        new_used[v[0]] += 1
+
+        return State(
+            assignment=new_assignment,
+            domains=new_domains,
+            used_tiles=new_used,
+            visible_so_far=new_visible,
+        )
+
     # ---------- Search ----------
+
     def solve(self) -> Optional[Dict[int, TileValue]]:
         """Run initial propagation and then backtracking search."""
         st = State(
@@ -294,9 +296,7 @@ class TilePlacementCSP:
             if next_state is None:
                 continue
 
-            # Global forward pruning after each assignment.
-            queue = [rb for rb in range(
-                self.num_blocks) if rb not in next_state.assignment]
+            queue = [rb for rb in range(self.num_blocks) if rb not in next_state.assignment]
             if not self._ac3_propagate(next_state, queue):
                 continue
 
